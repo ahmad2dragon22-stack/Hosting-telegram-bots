@@ -7,6 +7,8 @@ import asyncio
 import json
 import time
 import urllib.parse
+import shutil
+import uuid
 from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
@@ -29,10 +31,15 @@ METADATA_FILE = BOTS_DIR / "metadata.json"
 
 BOTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Ensure bot subfolders may be created later
 def _load_metadata():
     try:
         if METADATA_FILE.exists():
-            return json.loads(METADATA_FILE.read_text(encoding='utf-8'))
+            data = json.loads(METADATA_FILE.read_text(encoding='utf-8'))
+            # normalize
+            if 'bots' not in data:
+                data['bots'] = {}
+            return data
     except Exception:
         logging.exception("Failed to load metadata")
     return {"bots": {}}
@@ -48,14 +55,20 @@ running_bots = {}
 
 # --- الوظائف المساعدة ---
 
-def start_bot_process(file_path, bot_name):
-    """تشغيل ملف البوت كعملية فرعية والتقاط الأخطاء"""
+def start_bot_process(file_path, bot_name, extra_env: dict = None):
+    """تشغيل ملف البوت كعملية فرعية والتقاط الأخطاء
+    يدعم تمرير بيئة إضافية لكل بوت."""
     try:
+        env = os.environ.copy()
+        if extra_env:
+            env.update(extra_env)
+
         process = subprocess.Popen(
             [sys.executable, str(file_path)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True
+            text=True,
+            env=env
         )
         running_bots[bot_name] = {
             "process": process,
@@ -65,8 +78,8 @@ def start_bot_process(file_path, bot_name):
         }
         # سجل في الميتاداتا
         meta = _load_metadata()
-        meta["bots"][bot_name] = meta.get("bots", {}).get(bot_name, {})
-        meta["bots"][bot_name].update({"path": str(file_path), "last_started": int(time.time())})
+        meta["bots"].setdefault(bot_name, {})
+        meta["bots"][bot_name].update({"last_started": int(time.time())})
         _save_metadata(meta)
         return True, None
     except Exception as e:
@@ -94,20 +107,35 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ يرجى رفع ملفات Python فقط (.py)")
         return
 
-    # حفظ باسم آمن داخل المجلد (مسار مطلق)
-    file_path = BOTS_DIR / Path(doc.file_name).name
+    # اسم البوت يمكن تمريره في caption بصيغة: bot:اسم_البوت
+    bot_name = None
+    if update.message.caption:
+        cap = update.message.caption.strip()
+        if cap.lower().startswith('bot:'):
+            bot_name = cap.split(':', 1)[1].strip()
+
+    # إن لم يحدده المستخدم، استخدم اسم الملف (بدون امتداد)
+    if not bot_name:
+        bot_name = Path(doc.file_name).stem
+
+    # مجلد لكل بوت
+    bot_dir = BOTS_DIR / bot_name
+    bot_dir.mkdir(parents=True, exist_ok=True)
+
+    # حفظ الملف داخل مجلد البوت مع إرفاق uuid كنسخة
+    version_id = uuid.uuid4().hex[:8]
+    safe_name = f"{version_id}_{Path(doc.file_name).name}"
+    file_path = bot_dir / safe_name
 
     # تحميل الملف
     new_file = await context.bot.get_file(doc.file_id)
     saved = False
     try:
-        # محاولة التحميل بالطريقة المتوافقة
         if hasattr(new_file, 'download_to_drive'):
             await new_file.download_to_drive(str(file_path))
         elif hasattr(new_file, 'download'):
             await new_file.download(str(file_path))
         else:
-            # حفظ يدوياً من الذاكرة
             bio = await new_file.download_as_bytearray()
             file_path.write_bytes(bio)
         saved = file_path.exists()
@@ -119,48 +147,62 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ فشل حفظ الملف {doc.file_name} على الخادم.")
         return
 
-    # حدّث الميتاداتا
+    # حدّث الميتاداتا لدعم ملفات متعددة
     meta = _load_metadata()
-    meta.setdefault("bots", {})
-    meta["bots"][doc.file_name] = {
-        "path": str(file_path),
-        "uploaded_by": update.effective_user.id,
-        "uploaded_at": int(time.time())
-    }
+    meta.setdefault('bots', {})
+    bot_meta = meta['bots'].setdefault(bot_name, {})
+    files = bot_meta.setdefault('files', [])
+    files.append({
+        'id': version_id,
+        'filename': doc.file_name,
+        'path': str(file_path),
+        'uploaded_by': update.effective_user.id,
+        'uploaded_at': int(time.time())
+    })
+    # إعدادات افتراضية لكل بوت
+    bot_meta.setdefault('settings', {
+        'enabled': True,
+        'auto_restart': True,
+        'main': files[-1]['path']
+    })
     _save_metadata(meta)
 
-    await update.message.reply_text(f"📥 تم استلام {doc.file_name}. جاري التشغيل...")
-    
-    success, error = start_bot_process(file_path, doc.file_name)
-    
+    await update.message.reply_text(f"📥 تم استلام {doc.file_name} للبوت `{bot_name}` (id={version_id}). جاري التشغيل...", parse_mode='Markdown')
+
+    success, error = start_bot_process(file_path, bot_name)
+
     if success:
-        await update.message.reply_text(f"✅ تم تشغيل {doc.file_name} بنجاح!")
+        await update.message.reply_text(f"✅ تم تشغيل `{bot_name}` باستخدام الملف `{doc.file_name}`")
     else:
         await update.message.reply_text(f"❌ فشل التشغيل:\n`{error}`", parse_mode='Markdown')
 
 async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
+    meta = _load_metadata()
+    bots = meta.get('bots', {})
 
-    if not running_bots:
-        await update.message.reply_text("📭 لا توجد بوتات مشغلة حالياً.")
+    if not bots:
+        await update.message.reply_text("📭 لا توجد بوتات محفوظة حالياً.")
         return
 
     keyboard = []
-    # أزرار إدارة لكل بوت
-    for bot_name in running_bots.keys():
+    # أزرار إدارة لكل بوت (سواء كانت مشغلة أم لا)
+    for bot_name, info in bots.items():
         safe = urllib.parse.quote_plus(bot_name)
         keyboard.append([
-            InlineKeyboardButton(f"⏯ تشغيل {bot_name}", callback_data=f"run_{safe}"),
-            InlineKeyboardButton(f"🛑 إيقاف {bot_name}", callback_data=f"stop_{safe}"),
-            InlineKeyboardButton(f"🗑 حذف {bot_name}", callback_data=f"delete_{safe}")
+            InlineKeyboardButton(f"▶ تشغيل", callback_data=f"run_{safe}"),
+            InlineKeyboardButton(f"⏸ إيقاف", callback_data=f"stop_{safe}"),
+            InlineKeyboardButton(f"📁 ملفات", callback_data=f"files_{safe}"),
+            InlineKeyboardButton(f"⚙️ إعدادات", callback_data=f"cfg_{safe}"),
+            InlineKeyboardButton(f"🗑 حذف", callback_data=f"delete_{safe}")
         ])
 
-    # إضافة زر للمعلومات
+    # إضافة زر للمعلومات العامة
     keyboard.append([InlineKeyboardButton("ℹ️ معلومات البوت", callback_data="info")])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("🖥 لوحة التحكم بالبوتات المشغلة:", reply_markup=reply_markup)
+    await update.message.reply_text("🖥 لوحة التحكم بالبوتات:", reply_markup=reply_markup)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -189,11 +231,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text("⚠️ البوت متوقف بالفعل أو غير موجود.")
     elif cmd == 'run':
-        # شغّل البوت المخزن
+        # شغّل البوت المخزن باستخدام المسار الرئيسي في الإعدادات
         if bot_name in meta.get('bots', {}):
-            path = Path(meta['bots'][bot_name]['path'])
-            if path.exists():
-                success, error = start_bot_process(path, bot_name)
+            bot_meta = meta['bots'][bot_name]
+            main_path = None
+            if bot_meta.get('settings') and bot_meta['settings'].get('main'):
+                main_path = Path(bot_meta['settings']['main'])
+            else:
+                files = bot_meta.get('files', [])
+                if files:
+                    main_path = Path(files[-1]['path'])
+
+            if main_path and main_path.exists():
+                success, error = start_bot_process(main_path, bot_name)
                 if success:
                     await query.edit_message_text(f"▶️ تم تشغيل {bot_name}.")
                 else:
@@ -203,22 +253,43 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text("⚠️ لا توجد ميتاداتا لهذا البوت.")
     elif cmd == 'delete':
-        # حذف الملف والميتا
+        # حذف المجلد والميتا
         if bot_name in meta.get('bots', {}):
-            path = Path(meta['bots'][bot_name]['path'])
             try:
-                if path.exists():
-                    path.unlink()
+                bot_dir = BOTS_DIR / bot_name
+                if bot_dir.exists() and bot_dir.is_dir():
+                    shutil.rmtree(bot_dir)
                 del meta['bots'][bot_name]
                 _save_metadata(meta)
-                await query.edit_message_text(f"🗑 تم حذف {bot_name}")
+                await query.edit_message_text(f"🗑 تم حذف {bot_name} وجميع ملفاته")
             except Exception:
-                logging.exception("Failed to delete bot file")
+                logging.exception("Failed to delete bot folder")
                 await query.edit_message_text("❌ فشل الحذف.")
         else:
             await query.edit_message_text("⚠️ لا توجد ميتاداتا لهذا البوت.")
+    elif cmd == 'files':
+        # عرض قائمة الملفات للبوت
+        if bot_name in meta.get('bots', {}):
+            bot_meta = meta['bots'][bot_name]
+            files = bot_meta.get('files', [])
+            if not files:
+                await query.edit_message_text("⚠️ لا توجد ملفات لهذا البوت.")
+                return
+            lines = [f"{i+1}. {f['filename']} (id={f['id']})" for i, f in enumerate(files)]
+            await query.edit_message_text("📄 ملفات البوت:\n" + "\n".join(lines))
+        else:
+            await query.edit_message_text("⚠️ لا توجد ميتاداتا لهذا البوت.")
+    elif cmd == 'cfg':
+        # عرض إعدادات البوت
+        if bot_name in meta.get('bots', {}):
+            bot_meta = meta['bots'][bot_name]
+            settings = bot_meta.get('settings', {})
+            text = json.dumps(settings, ensure_ascii=False, indent=2)
+            await query.edit_message_text(f"⚙️ إعدادات `{bot_name}`:\n`{text}`", parse_mode='Markdown')
     else:
         await query.edit_message_text("⚠️ أمر غير معروف.")
+
+    return
 
 async def check_errors(context: ContextTypes.DEFAULT_TYPE):
     """وظيفة دورية للتحقق من الأخطاء في البوتات المشغلة"""
@@ -243,6 +314,174 @@ async def check_errors(context: ContextTypes.DEFAULT_TYPE):
             if bot_name in meta.get('bots', {}):
                 meta['bots'][bot_name]['last_exit'] = int(time.time())
                 _save_metadata(meta)
+
+
+async def files_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("❗ استخدم: /files <bot_name>")
+        return
+    bot_name = args[0]
+    meta = _load_metadata()
+    if bot_name not in meta.get('bots', {}):
+        await update.message.reply_text("⚠️ لا توجد ميتاداتا لهذا البوت.")
+        return
+    files = meta['bots'][bot_name].get('files', [])
+    if not files:
+        await update.message.reply_text("⚠️ لا توجد ملفات لهذا البوت.")
+        return
+    lines = [f"{i+1}. {f['filename']} (id={f['id']})" for i, f in enumerate(files)]
+    await update.message.reply_text("📄 ملفات البوت:\n" + "\n".join(lines))
+
+
+async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("❗ استخدم: /config <bot_name>")
+        return
+    bot_name = args[0]
+    meta = _load_metadata()
+    if bot_name not in meta.get('bots', {}):
+        await update.message.reply_text("⚠️ لا توجد ميتاداتا لهذا البوت.")
+        return
+    settings = meta['bots'][bot_name].get('settings', {})
+    await update.message.reply_text(f"⚙️ إعدادات `{bot_name}`:\n`{json.dumps(settings, ensure_ascii=False, indent=2)}`", parse_mode='Markdown')
+
+
+async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    args = context.args
+    if len(args) < 3:
+        await update.message.reply_text("❗ استخدم: /set <bot_name> <key> <value>")
+        return
+    bot_name, key = args[0], args[1]
+    value = " ".join(args[2:])
+    meta = _load_metadata()
+    if bot_name not in meta.get('bots', {}):
+        await update.message.reply_text("⚠️ لا توجد ميتاداتا لهذا البوت.")
+        return
+    bot_meta = meta['bots'][bot_name]
+    settings = bot_meta.setdefault('settings', {})
+    # attempt to coerce booleans/numbers
+    if value.lower() in ('true', 'false'):
+        val = value.lower() == 'true'
+    else:
+        try:
+            val = int(value)
+        except Exception:
+            val = value
+    settings[key] = val
+    _save_metadata(meta)
+    await update.message.reply_text(f"✅ تم تعيين `{key}` = `{val}` للبوت `{bot_name}`", parse_mode='Markdown')
+
+
+async def startbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("❗ استخدم: /startbot <bot_name>")
+        return
+    bot_name = args[0]
+    meta = _load_metadata()
+    if bot_name not in meta.get('bots', {}):
+        await update.message.reply_text("⚠️ لا توجد ميتاداتا لهذا البوت.")
+        return
+    bot_meta = meta['bots'][bot_name]
+    main_path = None
+    if bot_meta.get('settings') and bot_meta['settings'].get('main'):
+        main_path = Path(bot_meta['settings']['main'])
+    else:
+        files = bot_meta.get('files', [])
+        if files:
+            main_path = Path(files[-1]['path'])
+
+    if main_path and main_path.exists():
+        success, error = start_bot_process(main_path, bot_name)
+        if success:
+            await update.message.reply_text(f"▶️ تم تشغيل {bot_name}.")
+        else:
+            await update.message.reply_text(f"❌ فشل تشغيل: {error}")
+    else:
+        await update.message.reply_text("❌ ملف البوت غير موجود على الخادم.")
+
+
+async def stopbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("❗ استخدم: /stopbot <bot_name>")
+        return
+    bot_name = args[0]
+    if bot_name in running_bots:
+        try:
+            running_bots[bot_name]['process'].terminate()
+            del running_bots[bot_name]
+            await update.message.reply_text(f"⛔ تم إيقاف {bot_name}.")
+        except Exception:
+            logging.exception("Failed to stop bot")
+            await update.message.reply_text("❌ فشل الإيقاف.")
+    else:
+        await update.message.reply_text("⚠️ البوت غير مشغّل.")
+
+
+async def restartbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("❗ استخدم: /restartbot <bot_name>")
+        return
+    bot_name = args[0]
+    await stopbot_command(update, context)
+    await startbot_command(update, context)
+
+
+async def removefile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("❗ استخدم: /removefile <bot_name> <file_id_or_index>")
+        return
+    bot_name = args[0]
+    fid = args[1]
+    meta = _load_metadata()
+    if bot_name not in meta.get('bots', {}):
+        await update.message.reply_text("⚠️ لا توجد ميتاداتا لهذا البوت.")
+        return
+    bot_meta = meta['bots'][bot_name]
+    files = bot_meta.get('files', [])
+    target = None
+    # find by id or index
+    for i, f in enumerate(files):
+        if f['id'] == fid or str(i+1) == fid:
+            target = f
+            idx = i
+            break
+    if not target:
+        await update.message.reply_text("⚠️ لم أجد الملف المطلوب.")
+        return
+    try:
+        p = Path(target['path'])
+        if p.exists():
+            p.unlink()
+        files.pop(idx)
+        # if removed main, pick last as main
+        settings = bot_meta.setdefault('settings', {})
+        if settings.get('main') == str(p):
+            settings['main'] = files[-1]['path'] if files else None
+        _save_metadata(meta)
+        await update.message.reply_text(f"🗑 تم حذف الملف {target['filename']}")
+    except Exception:
+        logging.exception("Failed to remove file")
+        await update.message.reply_text("❌ فشل حذف الملف.")
 
 def main():
     async def _periodic_check(app: Application):
@@ -269,6 +508,13 @@ def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("dashboard", dashboard))
+    application.add_handler(CommandHandler("files", files_command))
+    application.add_handler(CommandHandler("config", config_command))
+    application.add_handler(CommandHandler("set", set_command))
+    application.add_handler(CommandHandler("startbot", startbot_command))
+    application.add_handler(CommandHandler("stopbot", stopbot_command))
+    application.add_handler(CommandHandler("restartbot", restartbot_command))
+    application.add_handler(CommandHandler("removefile", removefile_command))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(CallbackQueryHandler(button_handler))
 
