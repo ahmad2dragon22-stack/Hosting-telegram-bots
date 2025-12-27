@@ -7,6 +7,8 @@ import asyncio
 import json
 import time
 import urllib.parse
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
 import shutil
 import uuid
 from pathlib import Path
@@ -483,7 +485,28 @@ async def removefile_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logging.exception("Failed to remove file")
         await update.message.reply_text("❌ فشل حذف الملف.")
 
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b"OK")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+def run_health_server():
+    server_address = ('', 8000)
+    httpd = HTTPServer(server_address, HealthCheckHandler)
+    print("Health check server running on port 8000...")
+    httpd.serve_forever()
+
 def main():
+    # Start health check server in a separate thread
+    health_thread = threading.Thread(target=run_health_server, daemon=True)
+    health_thread.start()
+
     async def _periodic_check(app: Application):
         await asyncio.sleep(10)
         class _SimpleContext:

@@ -1,0 +1,30 @@
+name: hosting-telegram-bots
+services:
+  - name: hosting-telegram-bots
+    type: WEB
+    strategy:
+      type: ROLLING
+    routes:
+      - port: 8000
+        path: /
+    ports:
+      - port: 8000
+        protocol: http
+    regions:
+      - par
+    scalings:
+      - min: 1
+        max: 1
+    instance_types:
+      - type: nano
+    health_checks:
+      - grace_period: 5
+        interval: 30
+        restart_limit: 3
+        timeout: 5
+        tcp:
+          port: 8000
+    git:
+      repository: github.com/ahmad2dragon22-stack/Hosting-telegram-bots
+      branch: main
+      run_command: python main.py
