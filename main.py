@@ -301,9 +301,55 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logging.exception("Failed to delete bot folder")
                 await query.edit_message_text("❌ فشل الحذف.")
         else:
-            await query.edit_message_text("⚠️ لا توجد ميتad_id = ADMIN_ID:        return
+            await query.edit_message_text("⚠️ لا توجد ميتاداتا لهذا البوت.")
+    return
+
+
+async def files_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
     args = context.args
     if not args:
+        await update.message.reply_text("❗ استخدم: /files <bot_name>")
+        return
+    bot_name = args[0]
+    meta = _load_metadata()
+    if bot_name not in meta.get('bots', {}):
+        await update.message.reply_text("⚠️ لا توجد ميتاداتا لهذا البوت.")
+        return
+    bot_meta = meta['bots'][bot_name]
+    files = bot_meta.get('files', [])
+    if not files:
+        await update.message.reply_text("📭 لا توجد ملفات لهذا البوت.")
+        return
+    text = "📁 ملفات البوت:\n"
+    for i, f in enumerate(files, 1):
+        text += f"{i}. {f.get('filename')} (id: {f.get('id')})\n"
+    await update.message.reply_text(text)
+
+
+async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("❗ استخدم: /config <bot_name>")
+        return
+    bot_name = args[0]
+    meta = _load_metadata()
+    if bot_name not in meta.get('bots', {}):
+        await update.message.reply_text("⚠️ لا توجد ميتاداتا لهذا البوت.")
+        return
+    bot_meta = meta['bots'][bot_name]
+    settings = bot_meta.get('settings', {})
+    await update.message.reply_text("⚙️ إعدادات:\n" + json.dumps(settings, ensure_ascii=False, indent=2))
+
+
+async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    args = context.args
+    if len(args) < 3:
         await update.message.reply_text("❗ استخدم: /set <bot_name> <key> <value>")
         return
     bot_name, key = args[0], args[1]
@@ -314,7 +360,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     bot_meta = meta['bots'][bot_name]
     settings = bot_meta.setdefault('settings', {})
-    # attempt to coerce booleans/numbers
     if value.lower() in ('true', 'false'):
         val = value.lower() == 'true'
     else:
