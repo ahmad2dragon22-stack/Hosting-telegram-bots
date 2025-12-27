@@ -3,6 +3,7 @@ import signal
 import subprocess
 import logging
 import sys
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
@@ -131,7 +132,23 @@ def main():
 
     # فحص الأخطاء كل 30 ثانية
     job_queue = application.job_queue
-    job_queue.run_repeating(check_errors, interval=30, first=10)
+    if job_queue is not None:
+        job_queue.run_repeating(check_errors, interval=30, first=10)
+    else:
+        class _SimpleContext:
+            def __init__(self, bot):
+                self.bot = bot
+
+        async def _periodic_check():
+            await asyncio.sleep(10)
+            while True:
+                try:
+                    await check_errors(_SimpleContext(application.bot))
+                except Exception:
+                    logging.exception("Error in periodic_check")
+                await asyncio.sleep(30)
+
+        application.create_task(_periodic_check())
 
     print("Main Hosting Bot is running...")
     application.run_polling()
