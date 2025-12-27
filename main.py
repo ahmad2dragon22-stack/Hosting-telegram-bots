@@ -94,10 +94,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     
+    keyboard = [
+        [InlineKeyboardButton("🖥 لوحة التحكم", callback_data="dashboard_btn")],
+        [InlineKeyboardButton("⬆️ رفع بوت جديد", callback_data="upload_bot_btn")],
+        [InlineKeyboardButton("ℹ️ معلومات", callback_data="info_btn") ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
     await update.message.reply_text(
         "👋 أهلاً بك في مدير استضافة البوتات.\n\n"
-        "🔸 ارفع ملف بصيغة `.py` لتشغيله.\n"
-        "🔸 استخدم /dashboard لإدارة البوتات المشغلة."
+        "أنا هنا لمساعدتك في استضافة وإدارة بوتات Telegram الخاصة بك بسهولة.\n\n"
+        "اختر أحد الخيارات أدناه للبدء:",
+        reply_markup=reply_markup
     )
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -212,7 +220,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     meta = _load_metadata()
 
-    if data == 'info':
+    if data == 'info_btn':
+        await query.edit_message_text(f"🔖 إصدار البوت: {VERSION}\n👤 المالك: @ahmaddragon\n📦 عدد البوتات المحفوظة: {len(meta.get('bots', {}))}")
+        return
+    elif data == 'dashboard_btn':
+        await dashboard(update, context) # Call the dashboard function
+        return
+    elif data == 'upload_bot_btn':
+        await query.edit_message_text("الرجاء رفع ملف Python (بصيغة .py) لتشغيله.")
+        return
+
+    if data == 'info': # Old info button, keeping for compatibility if needed elsewhere
         await query.edit_message_text(f"🔖 إصدار البوت: {VERSION}\n👤 المالك: @ahmaddragon\n📦 عدد البوتات المحفوظة: {len(meta.get('bots', {}))}")
         return
 
