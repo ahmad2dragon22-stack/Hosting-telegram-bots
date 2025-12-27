@@ -123,32 +123,32 @@ async def check_errors(context: ContextTypes.DEFAULT_TYPE):
             del running_bots[bot_name]
 
 def main():
-    application = Application.builder().token(BOT_TOKEN).build()
+    async def _periodic_check(app: Application):
+        await asyncio.sleep(10)
+        class _SimpleContext:
+            def __init__(self, bot):
+                self.bot = bot
+
+        while True:
+            try:
+                await check_errors(_SimpleContext(app.bot))
+            except Exception:
+                logging.exception("Error in periodic_check")
+            await asyncio.sleep(30)
+
+    async def _on_startup(app: Application):
+        # إذا كانت JobQueue متاحة نستخدمها، وإلا ننشئ مهمة دورية بعد بدء التطبيق
+        if app.job_queue is not None:
+            app.job_queue.run_repeating(check_errors, interval=30, first=10)
+        else:
+            app.create_task(_periodic_check(app))
+
+    application = Application.builder().token(BOT_TOKEN).post_init(_on_startup).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("dashboard", dashboard))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(CallbackQueryHandler(button_handler))
-
-    # فحص الأخطاء كل 30 ثانية
-    job_queue = application.job_queue
-    if job_queue is not None:
-        job_queue.run_repeating(check_errors, interval=30, first=10)
-    else:
-        class _SimpleContext:
-            def __init__(self, bot):
-                self.bot = bot
-
-        async def _periodic_check():
-            await asyncio.sleep(10)
-            while True:
-                try:
-                    await check_errors(_SimpleContext(application.bot))
-                except Exception:
-                    logging.exception("Error in periodic_check")
-                await asyncio.sleep(30)
-
-        application.create_task(_periodic_check())
 
     print("Main Hosting Bot is running...")
     application.run_polling()
