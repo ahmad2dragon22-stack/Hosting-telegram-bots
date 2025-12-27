@@ -14,6 +14,7 @@ import uuid
 from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.helpers import escape_markdown
 
 # إعداد السجلات (Logs)
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -113,7 +114,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     doc = update.message.document
-    if not doc.file_name.endswith('.py'):
+    if not doc.file_name.endswith(".py"):
         await update.message.reply_text("❌ يرجى رفع ملفات Python فقط (.py)")
         return
 
@@ -177,27 +178,29 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     })
     _save_metadata(meta)
 
-    await update.message.reply_text(f"📥 تم استلام {doc.file_name} للبوت `{bot_name}` (id={version_id}). جاري التشغيل...", parse_mode='Markdown')
+    safe_file_name = escape_markdown(doc.file_name, version=2)
+    safe_bot_name = escape_markdown(bot_name, version=2)
+    safe_version_id = escape_markdown(version_id, version=2)
+
+    await update.message.reply_text(
+        f"📥 تم استلام {safe_file_name} للبوت `{safe_bot_name}` (id={safe_version_id}). جاري التشغيل...", 
+        parse_mode='MarkdownV2'
+    )
 
     success, error = start_bot_process(file_path, bot_name)
 
     if success:
-        await update.message.reply_text(f"✅ تم تشغيل `{bot_name}` باستخدام الملف `{doc.file_name}`")
+        await update.message.reply_text(f"✅ تم تشغيل `{safe_bot_name}` باستخدام الملف `{safe_file_name}`")
     else:
-        await update.message.reply_text(f"❌ فشل التشغيل:\n`{error}`", parse_mode='Markdown')
+        safe_error = escape_markdown(error, version=2)
+        await update.message.reply_text(f"❌ فشل التشغيل:\n`{safe_error}`", parse_mode='MarkdownV2')
 
-async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    meta = _load_metadata()
-    bots = meta.get('bots', {})
-
-    if not bots:
-        await update.message.reply_text("📭 لا توجد بوتات محفوظة حالياً.")
-        return
-
+async def get_dashboard_markup(meta_data):
     keyboard = []
-    # أزرار إدارة لكل بوت (سواء كانت مشغلة أم لا)
+    bots = meta_data.get('bots', {})
+    if not bots:
+        return None
+
     for bot_name, info in bots.items():
         safe = urllib.parse.quote_plus(bot_name)
         keyboard.append([
@@ -207,12 +210,24 @@ async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton(f"⚙️ إعدادات", callback_data=f"cfg_{safe}"),
             InlineKeyboardButton(f"🗑 حذف", callback_data=f"delete_{safe}")
         ])
-
-    # إضافة زر للمعلومات العامة
     keyboard.append([InlineKeyboardButton("ℹ️ معلومات البوت", callback_data="info")])
+    return InlineKeyboardMarkup(keyboard)
 
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("🖥 لوحة التحكم بالبوتات:", reply_markup=reply_markup)
+async def send_dashboard(message_object, context: ContextTypes.DEFAULT_TYPE):
+    meta = _load_metadata()
+    bots = meta.get("bots", {})
+
+    if not bots:
+        await message_object.reply_text("📭 لا توجد بوتات محفوظة حالياً.")
+        return
+
+    reply_markup = await get_dashboard_markup(meta)
+    await message_object.reply_text("🖥 لوحة التحكم بالبوتات:", reply_markup=reply_markup)
+
+async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    await send_dashboard(update.message, context)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -224,7 +239,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"🔖 إصدار البوت: {VERSION}\n👤 المالك: @ahmaddragon\n📦 عدد البوتات المحفوظة: {len(meta.get('bots', {}))}")
         return
     elif data == 'dashboard_btn':
-        await dashboard(update, context) # Call the dashboard function
+        await send_dashboard(query.message, context) 
         return
     elif data == 'upload_bot_btn':
         await query.edit_message_text("الرجاء رفع ملف Python (بصيغة .py) لتشغيله.")
@@ -286,97 +301,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logging.exception("Failed to delete bot folder")
                 await query.edit_message_text("❌ فشل الحذف.")
         else:
-            await query.edit_message_text("⚠️ لا توجد ميتاداتا لهذا البوت.")
-    elif cmd == 'files':
-        # عرض قائمة الملفات للبوت
-        if bot_name in meta.get('bots', {}):
-            bot_meta = meta['bots'][bot_name]
-            files = bot_meta.get('files', [])
-            if not files:
-                await query.edit_message_text("⚠️ لا توجد ملفات لهذا البوت.")
-                return
-            lines = [f"{i+1}. {f['filename']} (id={f['id']})" for i, f in enumerate(files)]
-            await query.edit_message_text("📄 ملفات البوت:\n" + "\n".join(lines))
-        else:
-            await query.edit_message_text("⚠️ لا توجد ميتاداتا لهذا البوت.")
-    elif cmd == 'cfg':
-        # عرض إعدادات البوت
-        if bot_name in meta.get('bots', {}):
-            bot_meta = meta['bots'][bot_name]
-            settings = bot_meta.get('settings', {})
-            text = json.dumps(settings, ensure_ascii=False, indent=2)
-            await query.edit_message_text(f"⚙️ إعدادات `{bot_name}`:\n`{text}`", parse_mode='Markdown')
-    else:
-        await query.edit_message_text("⚠️ أمر غير معروف.")
-
-    return
-
-async def check_errors(context: ContextTypes.DEFAULT_TYPE):
-    """وظيفة دورية للتحقق من الأخطاء في البوتات المشغلة"""
-    for bot_name, data in list(running_bots.items()):
-        process = data["process"]
-        # التحقق إذا توقفت العملية فجأة
-        poll = process.poll()
-        if poll is not None:
-            # العملية توقفت، قراءة الخطأ
-            _, stderr = process.communicate()
-            try:
-                await context.bot.send_message(
-                    chat_id=ADMIN_ID,
-                    text=f"🚨 البوت `{bot_name}` توقف عن العمل!\n\n**الخطأ:**\n`{stderr}`",
-                    parse_mode='Markdown'
-                )
-            except Exception:
-                logging.exception("Failed to notify admin")
-            del running_bots[bot_name]
-            # حدّث الميتاداتا لوسم التوقف
-            meta = _load_metadata()
-            if bot_name in meta.get('bots', {}):
-                meta['bots'][bot_name]['last_exit'] = int(time.time())
-                _save_metadata(meta)
-
-
-async def files_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
+            await query.edit_message_text("⚠️ لا توجد ميتad_id = ADMIN_ID:        return
     args = context.args
     if not args:
-        await update.message.reply_text("❗ استخدم: /files <bot_name>")
-        return
-    bot_name = args[0]
-    meta = _load_metadata()
-    if bot_name not in meta.get('bots', {}):
-        await update.message.reply_text("⚠️ لا توجد ميتاداتا لهذا البوت.")
-        return
-    files = meta['bots'][bot_name].get('files', [])
-    if not files:
-        await update.message.reply_text("⚠️ لا توجد ملفات لهذا البوت.")
-        return
-    lines = [f"{i+1}. {f['filename']} (id={f['id']})" for i, f in enumerate(files)]
-    await update.message.reply_text("📄 ملفات البوت:\n" + "\n".join(lines))
-
-
-async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    args = context.args
-    if not args:
-        await update.message.reply_text("❗ استخدم: /config <bot_name>")
-        return
-    bot_name = args[0]
-    meta = _load_metadata()
-    if bot_name not in meta.get('bots', {}):
-        await update.message.reply_text("⚠️ لا توجد ميتاداتا لهذا البوت.")
-        return
-    settings = meta['bots'][bot_name].get('settings', {})
-    await update.message.reply_text(f"⚙️ إعدادات `{bot_name}`:\n`{json.dumps(settings, ensure_ascii=False, indent=2)}`", parse_mode='Markdown')
-
-
-async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    args = context.args
-    if len(args) < 3:
         await update.message.reply_text("❗ استخدم: /set <bot_name> <key> <value>")
         return
     bot_name, key = args[0], args[1]
