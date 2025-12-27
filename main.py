@@ -20,7 +20,7 @@ from telegram.helpers import escape_markdown
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 # --- الإعدادات ---
-VERSION = "1.2.0"
+VERSION = "2.3"
 DEFAULT_ADMIN_ID = 8049455831 # استبدل هذا بـ ID حسابك في تيليجرام
 DEFAULT_BOT_TOKEN = "8328934625:AAEKHcqH7jbizVE6iByqIOikVpEVmshbwr0"
 
@@ -51,7 +51,30 @@ def _load_metadata():
         return {"bots": {}}
     except Exception:
         logging.exception("Failed to load metadata")
-    return {"bots": {}}
+    # ensure some top-level keys
+    data = {"bots": {}, "admins": [], "subscriptions": {}, "allowed": {}}
+    try:
+        if METADATA_FILE.exists():
+            content = METADATA_FILE.read_text(encoding='utf-8')
+            if not content.strip():
+                return data
+            loaded = json.loads(content)
+            # normalize
+            if 'bots' not in loaded:
+                loaded['bots'] = {}
+            if 'admins' not in loaded:
+                loaded['admins'] = []
+            if 'subscriptions' not in loaded:
+                loaded['subscriptions'] = {}
+            if 'allowed' not in loaded:
+                loaded['allowed'] = {}
+            return loaded
+    except json.JSONDecodeError:
+        logging.error("Metadata file is corrupted. Resetting.")
+        return data
+    except Exception:
+        logging.exception("Failed to load metadata")
+    return data
 
 def _save_metadata(meta: dict):
     try:
@@ -64,6 +87,50 @@ def _save_metadata(meta: dict):
 
 # قاموس لتخزين العمليات المشغلة (Process ID: Process Object)
 running_bots = {}
+
+# --- صلاحيات واشتراكات ---
+def get_metadata_admins():
+    meta = _load_metadata()
+    admins = set(meta.get('admins', []) or [])
+    try:
+        admins.add(int(ADMIN_ID))
+    except Exception:
+        pass
+    return admins
+
+def is_authorized(user_id: int) -> bool:
+    """صلاحيات: فقط ADMIN_ID أو من في قائمة admins أو allowed يستطيعون استخدام الأدوات الإدارية"""
+    try:
+        meta = _load_metadata()
+        if int(user_id) == int(ADMIN_ID):
+            return True
+        if str(user_id) in map(str, meta.get('admins', [])):
+            return True
+        if str(user_id) in meta.get('allowed', {}):
+            return True
+    except Exception:
+        logging.exception('is_authorized failed')
+    return False
+
+def install_requirements(bot_dir: Path) -> (bool, str):
+    """Install requirements from requirements.txt inside bot_dir. Returns (success, output)."""
+    req = bot_dir / 'requirements.txt'
+    log = bot_dir / 'install.log'
+    if not req.exists():
+        return False, 'requirements.txt not found'
+    try:
+        cmd = [sys.executable, '-m', 'pip', 'install', '-r', str(req)]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        out = proc.stdout + '\n' + proc.stderr
+        log.write_text(out, encoding='utf-8')
+        return proc.returncode == 0, out
+    except Exception as e:
+        logging.exception('Failed to install requirements')
+        try:
+            log.write_text(str(e), encoding='utf-8')
+        except Exception:
+            pass
+        return False, str(e)
 
 # --- الوظائف المساعدة ---
 
@@ -89,9 +156,14 @@ def start_bot_process(file_path, bot_name, extra_env: dict = None):
 
         # Ensure PYTHONPATH includes the bot directory
         env["PYTHONPATH"] = f"{file_path.parent}:{env.get('PYTHONPATH', '')}"
-        
-        # التقاط الخطأ في ملف لسهولة القراءة لاحقاً
+        # Put storage path for the bot so hosted bots can persist data
+        storage_dir = file_path.parent / "storage"
+        storage_dir.mkdir(parents=True, exist_ok=True)
+        env["BOT_STORAGE_PATH"] = str(storage_dir)
+
+        # إعداد ملفات السجل
         error_log_path = file_path.parent / "error.log"
+        out_log_path = file_path.parent / "output.log"
 
         process = subprocess.Popen(
             [sys.executable, "-u", str(file_path)], # -u for unbuffered output
@@ -107,6 +179,19 @@ def start_bot_process(file_path, bot_name, extra_env: dict = None):
             "pid": process.pid,
             "started_at": int(time.time())
         }
+        # Start threads to capture stdout/stderr into files
+        def _reader(pipe, path):
+            try:
+                with open(path, 'a', encoding='utf-8') as fh:
+                    for line in iter(pipe.readline, ''):
+                        fh.write(f"[{int(time.time())}] {line}")
+            except Exception:
+                logging.exception('Failed to capture process IO')
+
+        t_out = threading.Thread(target=_reader, args=(process.stdout, out_log_path), daemon=True)
+        t_err = threading.Thread(target=_reader, args=(process.stderr, error_log_path), daemon=True)
+        t_out.start()
+        t_err.start()
         # سجل في الميتاداتا
         meta = _load_metadata()
         meta["bots"].setdefault(bot_name, {})
@@ -125,7 +210,7 @@ def start_bot_process(file_path, bot_name, extra_env: dict = None):
 # --- أوامر البوت الرئيسي ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_authorized(update.effective_user.id):
         return
     
     keyboard = [
@@ -144,12 +229,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_authorized(update.effective_user.id):
         return
 
     doc = update.message.document
-    if not doc.file_name.endswith(".py"):
-        await update.message.reply_text("❌ يرجى رفع ملفات Python فقط (.py)")
+    # دعم رفع ملف requirements.txt أو ملف .py
+    if not (doc.file_name.endswith('.py') or doc.file_name.lower() == 'requirements.txt'):
+        await update.message.reply_text("❌ يرجى رفع ملفات Python فقط (.py) أو ملف requirements.txt")
         return
 
     # اسم البوت يمكن تمريره في caption بصيغة: bot:اسم_البوت
@@ -212,6 +298,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     })
     _save_metadata(meta)
 
+    # إذا كان ملف متطلبات، نقوم بتثبيت الحزم داخل مجلد البوت
+    if doc.file_name.lower() == 'requirements.txt':
+        await update.message.reply_text("🔧 تم حفظ requirements.txt. جاري تثبيت الحزم...")
+        ok, out = install_requirements(bot_dir)
+        if ok:
+            await update.message.reply_text("✅ تم تثبيت الحزم بنجاح. راجع install.log للمخرجات.")
+        else:
+            await update.message.reply_text("⚠️ حدث خطأ أثناء التثبيت. راجع install.log للمخرجات.")
+        return
+
     safe_file_name = escape_markdown(doc.file_name, version=2)
     safe_bot_name = escape_markdown(bot_name, version=2)
     safe_version_id = escape_markdown(version_id, version=2)
@@ -261,7 +357,7 @@ async def send_dashboard(message_object, context: ContextTypes.DEFAULT_TYPE):
     await message_object.reply_text("🖥 لوحة التحكم بالبوتات:", reply_markup=reply_markup)
 
 async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_authorized(update.effective_user.id):
         return
     await send_dashboard(update.message, context)
 
@@ -272,7 +368,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     meta = _load_metadata()
 
     if data == "info_btn":
-        await query.edit_message_text(f"🔖 إصدار البوت: {VERSION}\n👤 المالك: @ahmaddragon\n📦 عدد البوتات المحفوظة: {len(meta.get("bots", {}))}")
+        await query.edit_message_text(f"🔖 إصدار البوت: {VERSION}\n👤 المالك: @ahmaddragon\n📦 عدد البوتات المحفوظة: {len(meta.get('bots', {}))}")
         return
     elif data == "dashboard_btn":
         await send_dashboard(query.message, context) 
@@ -336,14 +432,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⚠️ لا توجد ميتاداتا لهذا البوت.")
     elif cmd == "files":
         # عرض قائمة الملفات للبوت
-        if bot_name in meta.get("bots", {}):
-            bot_meta = meta["bots"][bot_name]
-            files = bot_meta.get("files", [])
+        if bot_name in meta.get('bots', {}):
+            bot_meta = meta['bots'][bot_name]
+            files = bot_meta.get('files', [])
             if not files:
-                await query.edit_message_text("⚠️ لا توجد ملفات لهذا البوت.")
+                await query.edit_message_text('⚠️ لا توجد ملفات لهذا البوت.')
                 return
-            lines = [f"{i+1}. {f["filename"]} (id={f["id"]})" for i, f in enumerate(files)]
-            await query.edit_message_text("📄 ملفات البوت:\n" + "\n".join(lines))
+            lines = [f"{i+1}. {f['filename']} (id={f['id']})" for i, f in enumerate(files)]
+            await query.edit_message_text('📄 ملفات البوت:\n' + '\n'.join(lines))
         else:
             await query.edit_message_text("⚠️ لا توجد ميتاداتا لهذا البوت.")
     elif cmd == "cfg":
@@ -378,26 +474,33 @@ async def check_errors(context: ContextTypes.DEFAULT_TYPE):
         # التحقق إذا توقفت العملية فجأة
         poll = process.poll()
         if poll is not None:
-            # العملية توقفت، قراءة الخطأ
-            _, stderr = process.communicate()
+            # العملية توقفت، نحاول قراءة السجل من ملف error.log
+            bot_dir = BOTS_DIR / bot_name
+            err_path = bot_dir / 'error.log'
+            stderr = ''
             try:
+                if err_path.exists():
+                    stderr = err_path.read_text(encoding='utf-8')[-4000:]
                 await context.bot.send_message(
                     chat_id=ADMIN_ID,
-                    text=f"🚨 البوت `{bot_name}` توقف عن العمل!\n\n**الخطأ:**\n`{stderr}`",
+                    text=f"🚨 البوت `{bot_name}` توقف عن العمل!\n\n**الخطأ (آخر جزء):**\n`{stderr}`",
                     parse_mode="Markdown"
                 )
             except Exception:
                 logging.exception("Failed to notify admin")
-            del running_bots[bot_name]
-            # حدّث الميتاداتا لوسم التوقف
+            # أزل البوت من running list ووسم التوقف
+            try:
+                del running_bots[bot_name]
+            except Exception:
+                pass
             meta = _load_metadata()
-            if bot_name in meta.get("bots", {}):
-                meta["bots"][bot_name]["last_exit"] = int(time.time())
+            if bot_name in meta.get('bots', {}):
+                meta['bots'][bot_name]['last_exit'] = int(time.time())
                 _save_metadata(meta)
 
 
 async def files_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_authorized(update.effective_user.id):
         return
     args = context.args
     if not args:
@@ -415,12 +518,12 @@ async def files_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = "📁 ملفات البوت:\n"
     for i, f in enumerate(files, 1):
-        text += f"{i}. {f.get("filename")} (id: {f.get("id")})\n"
+        text += f"{i}. {f.get('filename')} (id: {f.get('id')})\n"
     await update.message.reply_text(text)
 
 
 async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_authorized(update.effective_user.id):
         return
     args = context.args
     if not args:
@@ -437,7 +540,7 @@ async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_authorized(update.effective_user.id):
         return
     args = context.args
     if len(args) < 3:
@@ -464,7 +567,7 @@ async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def startbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_authorized(update.effective_user.id):
         return
     args = context.args
     if not args:
@@ -495,7 +598,7 @@ async def startbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def stopbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_authorized(update.effective_user.id):
         return
     args = context.args
     if not args:
@@ -515,7 +618,7 @@ async def stopbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def restartbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_authorized(update.effective_user.id):
         return
     args = context.args
     if not args:
@@ -527,7 +630,7 @@ async def restartbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def removefile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_authorized(update.effective_user.id):
         return
     args = context.args
     if len(args) < 2:
@@ -565,6 +668,68 @@ async def removefile_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception:
         logging.exception("Failed to remove file")
         await update.message.reply_text("❌ فشل حذف الملف.")
+
+
+async def allow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id):
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("❗ استخدم: /allow <user_id>")
+        return
+    uid = str(args[0])
+    meta = _load_metadata()
+    allowed = meta.setdefault('allowed', {})
+    allowed[uid] = True
+    _save_metadata(meta)
+    await update.message.reply_text(f"✅ تم السماح للمستخدم: {uid}")
+
+
+async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id):
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("❗ استخدم: /revoke <user_id>")
+        return
+    uid = str(args[0])
+    meta = _load_metadata()
+    allowed = meta.setdefault('allowed', {})
+    if uid in allowed:
+        del allowed[uid]
+        _save_metadata(meta)
+        await update.message.reply_text(f"🗑 تم سحب الصلاحية من: {uid}")
+    else:
+        await update.message.reply_text("⚠️ المستخدم غير موجود في قائمة المسموحين.")
+
+
+async def grant_stars_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id):
+        return
+    args = context.args
+    if len(args) < 3:
+        await update.message.reply_text("❗ استخدم: /grant_stars <user_id> <count> <days>")
+        return
+    uid = str(args[0])
+    try:
+        count = int(args[1])
+        days = int(args[2])
+    except Exception:
+        await update.message.reply_text("❗ تأكد من صحة القيم (عدد النجوم وعدد الأيام)")
+        return
+    meta = _load_metadata()
+    subs = meta.setdefault('subscriptions', {})
+    entry = subs.setdefault(uid, {'stars': 0, 'expiry': 0})
+    entry['stars'] = entry.get('stars', 0) + count
+    expiry = max(int(time.time()), entry.get('expiry', 0)) + days * 24 * 3600
+    entry['expiry'] = expiry
+    _save_metadata(meta)
+    await update.message.reply_text(f"⭐ تم إضافة {count} نجوم للمستخدم {uid} لمدة {days} يوم.")
+    # Notify admin/owner about delivery
+    try:
+        await context.bot.send_message(chat_id=ADMIN_ID, text=f"تم توصيل {count} نجوم إلى {uid} من قبل {update.effective_user.id}")
+    except Exception:
+        pass
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -639,6 +804,9 @@ def main():
     application.add_handler(CommandHandler("stopbot", stopbot_command))
     application.add_handler(CommandHandler("restartbot", restartbot_command))
     application.add_handler(CommandHandler("removefile", removefile_command))
+    application.add_handler(CommandHandler("allow", allow_command))
+    application.add_handler(CommandHandler("revoke", revoke_command))
+    application.add_handler(CommandHandler("grant_stars", grant_stars_command))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(CallbackQueryHandler(button_handler))
 
