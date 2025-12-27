@@ -38,18 +38,27 @@ BOTS_DIR.mkdir(parents=True, exist_ok=True)
 def _load_metadata():
     try:
         if METADATA_FILE.exists():
-            data = json.loads(METADATA_FILE.read_text(encoding='utf-8'))
+            content = METADATA_FILE.read_text(encoding='utf-8')
+            if not content.strip():
+                return {"bots": {}}
+            data = json.loads(content)
             # normalize
             if 'bots' not in data:
                 data['bots'] = {}
             return data
+    except json.JSONDecodeError:
+        logging.error("Metadata file is corrupted. Resetting.")
+        return {"bots": {}}
     except Exception:
         logging.exception("Failed to load metadata")
     return {"bots": {}}
 
 def _save_metadata(meta: dict):
     try:
-        METADATA_FILE.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8')
+        # Write to a temporary file first to prevent corruption during crash
+        temp_file = METADATA_FILE.with_suffix(".tmp")
+        temp_file.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8')
+        temp_file.replace(METADATA_FILE)
     except Exception:
         logging.exception("Failed to save metadata")
 
@@ -62,16 +71,35 @@ def start_bot_process(file_path, bot_name, extra_env: dict = None):
     """تشغيل ملف البوت كعملية فرعية والتقاط الأخطاء
     يدعم تمرير بيئة إضافية لكل بوت."""
     try:
+        file_path = Path(file_path).resolve()
+        if not file_path.exists():
+            return False, f"File not found: {file_path}"
+
+        # إيقاف البوت إذا كان يعمل بالفعل
+        if bot_name in running_bots:
+            try:
+                running_bots[bot_name]["process"].terminate()
+                running_bots[bot_name]["process"].wait(timeout=5)
+            except Exception:
+                pass
+
         env = os.environ.copy()
         if extra_env:
             env.update(extra_env)
 
+        # Ensure PYTHONPATH includes the bot directory
+        env["PYTHONPATH"] = f"{file_path.parent}:{env.get('PYTHONPATH', '')}"
+        
+        # التقاط الخطأ في ملف لسهولة القراءة لاحقاً
+        error_log_path = file_path.parent / "error.log"
+
         process = subprocess.Popen(
-            [sys.executable, str(file_path)],
+            [sys.executable, "-u", str(file_path)], # -u for unbuffered output
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            env=env
+            env=env,
+            cwd=str(file_path.parent) # Run from the bot's directory
         )
         running_bots[bot_name] = {
             "process": process,
@@ -82,11 +110,16 @@ def start_bot_process(file_path, bot_name, extra_env: dict = None):
         # سجل في الميتاداتا
         meta = _load_metadata()
         meta["bots"].setdefault(bot_name, {})
-        meta["bots"][bot_name].update({"last_started": int(time.time())})
+        meta["bots"][bot_name].update({
+            "last_started": int(time.time()),
+            "status": "running",
+            "main": str(file_path)
+        })
         _save_metadata(meta)
+        logging.info(f"Started bot: {bot_name} (PID: {process.pid})")
         return True, None
     except Exception as e:
-        logging.exception("Failed to start bot process")
+        logging.exception(f"Failed to start bot process: {bot_name}")
         return False, str(e)
 
 # --- أوامر البوت الرئيسي ---
@@ -104,6 +137,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "👋 أهلاً بك في مدير استضافة البوتات.\n\n"
+        "⚠️ **ملاحظة هامة:** هذه الاستضافة تستخدم نظام ملفات مؤقت. إذا تمت إعادة تشغيل السيرفر أو تحديث الكود، فقد يتم حذف ملفات البوتات المرفوعة ما لم يتم ربط مساحة تخزين دائمة (Persistent Volume).\n\n"
         "أنا هنا لمساعدتك في استضافة وإدارة بوتات Telegram الخاصة بك بسهولة.\n\n"
         "اختر أحد الخيارات أدناه للبدء:",
         reply_markup=reply_markup
@@ -203,14 +237,16 @@ async def get_dashboard_markup(meta_data):
 
     for bot_name, info in bots.items():
         safe = urllib.parse.quote_plus(bot_name)
+        status_icon = "🟢" if bot_name in running_bots else "🔴"
+        keyboard.append([InlineKeyboardButton(f"{status_icon} {bot_name}", callback_data=f"info_{safe}")])
         keyboard.append([
-            InlineKeyboardButton(f"▶ تشغيل", callback_data=f"run_{safe}"),
-            InlineKeyboardButton(f"⏸ إيقاف", callback_data=f"stop_{safe}"),
-            InlineKeyboardButton(f"📁 ملفات", callback_data=f"files_{safe}"),
-            InlineKeyboardButton(f"⚙️ إعدادات", callback_data=f"cfg_{safe}"),
-            InlineKeyboardButton(f"🗑 حذف", callback_data=f"delete_{safe}")
+            InlineKeyboardButton(f"▶", callback_data=f"run_{safe}"),
+            InlineKeyboardButton(f"⏸", callback_data=f"stop_{safe}"),
+            InlineKeyboardButton(f"📁", callback_data=f"files_{safe}"),
+            InlineKeyboardButton(f"⚙️", callback_data=f"cfg_{safe}"),
+            InlineKeyboardButton(f"🗑", callback_data=f"delete_{safe}")
         ])
-    keyboard.append([InlineKeyboardButton("ℹ️ معلومات البوت", callback_data="info")])
+    keyboard.append([InlineKeyboardButton("🔄 تحديث", callback_data="dashboard_btn")])
     return InlineKeyboardMarkup(keyboard)
 
 async def send_dashboard(message_object, context: ContextTypes.DEFAULT_TYPE):
@@ -242,11 +278,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_dashboard(query.message, context) 
         return
     elif data == "upload_bot_btn":
-        await query.edit_message_text("الرجاء رفع ملف Python (بصيغة .py) لتشغيله.")
-        return
-
-    if data == "info": # Old info button, keeping for compatibility if needed elsewhere
-        await query.edit_message_text(f"🔖 إصدار البوت: {VERSION}\n👤 المالك: @ahmaddragon\n📦 عدد البوتات المحفوظة: {len(meta.get("bots", {}))}")
+        await query.edit_message_text("الرجاء رفع ملف Python (بصيغة .py) لتشغيله.\n\nيمكنك كتابة `bot:اسم_البوت` في وصف الملف لتسميته.")
         return
 
     # فك ترميز الاسم
@@ -321,6 +353,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             settings = bot_meta.get("settings", {})
             text = json.dumps(settings, ensure_ascii=False, indent=2)
             await query.edit_message_text(f"⚙️ إعدادات `{bot_name}`:\n`{text}`", parse_mode="Markdown")
+    elif cmd == "info":
+        if bot_name in meta.get("bots", {}):
+            info = meta["bots"][bot_name]
+            status = "يعمل 🟢" if bot_name in running_bots else "متوقف 🔴"
+            last_started = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(info.get('last_started', 0)))
+            text = (
+                f"ℹ️ معلومات البوت: {bot_name}\n"
+                f"📊 الحالة: {status}\n"
+                f"📂 عدد الملفات: {len(info.get('files', []))}\n"
+                f"⏰ آخر تشغيل: {last_started}\n"
+                f"🚀 المسار الرئيسي: `{info.get('settings', {}).get('main', 'غير محدد')}`"
+            )
+            await query.edit_message_text(text, parse_mode="Markdown")
     else:
         await query.edit_message_text("⚠️ أمر غير معروف.")
 
@@ -556,7 +601,27 @@ def main():
                 logging.exception("Error in periodic_check")
             await asyncio.sleep(30)
 
+    async def restart_all_bots():
+        """إعادة تشغيل جميع البوتات التي كانت تعمل عند الإغلاق"""
+        meta = _load_metadata()
+        bots = meta.get("bots", {})
+        for bot_name, bot_meta in bots.items():
+            settings = bot_meta.get("settings", {})
+            if settings.get("enabled", True) and settings.get("auto_restart", True):
+                main_path = settings.get("main")
+                if not main_path:
+                    files = bot_meta.get("files", [])
+                    if files:
+                        main_path = files[-1]["path"]
+                
+                if main_path and Path(main_path).exists():
+                    logging.info(f"Auto-restarting bot: {bot_name}")
+                    start_bot_process(main_path, bot_name)
+
     async def _on_startup(app: Application):
+        # تشغيل البوتات المخزنة
+        await restart_all_bots()
+        
         # إذا كانت JobQueue متاحة نستخدمها، وإلا ننشئ مهمة دورية بعد بدء التطبيق
         if app.job_queue is not None:
             app.job_queue.run_repeating(check_errors, interval=30, first=10)
