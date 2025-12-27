@@ -100,16 +100,41 @@ def get_metadata_admins():
         pass
     return admins
 
-def is_authorized(user_id: int) -> bool:
-    """صلاحيات: فقط ADMIN_ID أو من في قائمة admins أو allowed يستطيعون استخدام الأدوات الإدارية"""
+def is_authorized(user_identifier, username=None) -> bool:
+    """صلاحيات: يقبل معرف رقمي أو اسم مستخدم.
+    نتحقق من ADMIN_ID، أو من 'admins' في الميتاداتا (يمكن أن تكون أرقام أو أسماء مستخدمين مع @)، أو من 'allowed'."""
     try:
         meta = _load_metadata()
-        if int(user_id) == int(ADMIN_ID):
-            return True
-        if str(user_id) in map(str, meta.get('admins', [])):
-            return True
-        if str(user_id) in meta.get('allowed', {}):
-            return True
+        # direct match against configured ADMIN_ID
+        try:
+            if int(user_identifier) == int(ADMIN_ID):
+                return True
+        except Exception:
+            pass
+
+        # check numeric/string ids in admins
+        for a in meta.get('admins', []) or []:
+            if not a:
+                continue
+            astr = str(a)
+            # numeric match
+            if str(user_identifier) == astr:
+                return True
+            # username match (support entries like 'ahmad' or '@ahmad')
+            if username:
+                uname = username.lstrip('@').lower()
+                if astr.lstrip('@').lower() == uname:
+                    return True
+
+        # allowed map may contain keys as ids or usernames
+        allowed = meta.get('allowed', {}) or {}
+        for k in list(allowed.keys()):
+            kstr = str(k)
+            if str(user_identifier) == kstr:
+                return True
+            if username and kstr.lstrip('@').lower() == username.lstrip('@').lower():
+                return True
+
     except Exception:
         logging.exception('is_authorized failed')
     return False
@@ -247,7 +272,7 @@ def start_bot_process(file_path, bot_name, extra_env: dict = None):
 # --- أوامر البوت الرئيسي ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
+    if not is_authorized(update.effective_user.id, getattr(update.effective_user, 'username', None)):
         return
     
     keyboard = [
@@ -266,7 +291,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
+    if not is_authorized(update.effective_user.id, getattr(update.effective_user, 'username', None)):
         return
 
     user_id = update.effective_user.id
@@ -361,7 +386,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     safe_file_name = escape_markdown(doc.file_name, version=2)
     safe_bot_name = escape_markdown(bot_name, version=2)
-    safe_version_id = escape_markdown(version=2, text=version_id)
+    safe_version_id = escape_markdown(version_id, version=2)
 
     await update.message.reply_text(
         f"📥 تم استلام {safe_file_name} للبوت `{safe_bot_name}` (id={safe_version_id}). جاري التشغيل...", 
@@ -428,7 +453,7 @@ async def send_dashboard(message_object, context: ContextTypes.DEFAULT_TYPE):
         await message_object.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
 
 async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
+    if not is_authorized(update.effective_user.id, getattr(update.effective_user, 'username', None)):
         return
     await send_dashboard(update.message, context)
 
@@ -605,7 +630,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # New handler for editing file content
 async def handle_code_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
+    if not is_authorized(update.effective_user.id, getattr(update.effective_user, 'username', None)):
         return
 
     if 'editing_file' in context.user_data and update.message.text:
@@ -677,7 +702,7 @@ async def check_errors(context: ContextTypes.DEFAULT_TYPE):
                     _save_metadata(meta)
 
 async def schedule_task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
+    if not is_authorized(update.effective_user.id, getattr(update.effective_user, 'username', None)):
         return
     args = context.args
     if len(args) < 3:
@@ -706,8 +731,16 @@ async def schedule_task_command(update: Update, context: ContextTypes.DEFAULT_TY
 
     # Define the callback for the scheduled job
     async def scheduled_action(ctx: ContextTypes.DEFAULT_TYPE):
+        # reload metadata at execution time
+        meta = _load_metadata()
         if action == "start":
-            await start_bot_process(Path(meta["bots"][bot_name]["settings"]["main"]), bot_name)
+            try:
+                main_p = Path(meta["bots"][bot_name]["settings"]["main"])
+            except Exception:
+                files = meta.get("bots", {}).get(bot_name, {}).get("files", [])
+                main_p = Path(files[-1]["path"]) if files else None
+            if main_p:
+                await start_bot_process(main_p, bot_name)
             await ctx.bot.send_message(chat_id=ADMIN_ID, text=f"▶️ تم تشغيل البوت المجدول: {bot_name}")
         elif action == "stop":
             if bot_name in running_bots:
@@ -717,7 +750,8 @@ async def schedule_task_command(update: Update, context: ContextTypes.DEFAULT_TY
 
     # Schedule the job
     if frequency == "daily":
-        job_queue.run_daily(scheduled_action, time=time. वेळ(hour=hour, minute=minute), data={"bot_name": bot_name, "action": action})
+        import datetime as _dt
+        job_queue.run_daily(scheduled_action, time=_dt.time(hour=hour, minute=minute), data={"bot_name": bot_name, "action": action})
         await update.message.reply_text(f"✅ تم جدولة {action} للبوت {bot_name} يومياً في {time_str}.")
     else:
         # For 'once', we need to calculate the next run time
@@ -730,7 +764,7 @@ async def schedule_task_command(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(f"✅ تم جدولة {action} للبوت {bot_name} مرة واحدة في {time_str}.")
 
 async def files_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
+    if not is_authorized(update.effective_user.id, getattr(update.effective_user, 'username', None)):
         return
     args = context.args
     if not args:
@@ -753,7 +787,7 @@ async def files_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
+    if not is_authorized(update.effective_user.id, getattr(update.effective_user, 'username', None)):
         return
     args = context.args
     if not args:
@@ -770,7 +804,7 @@ async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
+    if not is_authorized(update.effective_user.id, getattr(update.effective_user, 'username', None)):
         return
     args = context.args
     if len(args) < 3:
@@ -797,7 +831,7 @@ async def set_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def startbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
+    if not is_authorized(update.effective_user.id, getattr(update.effective_user, 'username', None)):
         return
     args = context.args
     if not args:
@@ -828,7 +862,7 @@ async def startbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def stopbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
+    if not is_authorized(update.effective_user.id, getattr(update.effective_user, 'username', None)):
         return
     args = context.args
     if not args:
@@ -848,7 +882,7 @@ async def stopbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def restartbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
+    if not is_authorized(update.effective_user.id, getattr(update.effective_user, 'username', None)):
         return
     args = context.args
     if not args:
@@ -860,7 +894,7 @@ async def restartbot_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def removefile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
+    if not is_authorized(update.effective_user.id, getattr(update.effective_user, 'username', None)):
         return
     args = context.args
     if len(args) < 2:
@@ -894,14 +928,14 @@ async def removefile_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if settings.get("main") == str(p):
             settings["main"] = files[-1]["path"] if files else None
         _save_metadata(meta)
-        await update.message.reply_text(f"🗑 تم حذف الملف {target["filename"]}")
+        await update.message.reply_text(f"🗑 تم حذف الملف {target['filename']}")
     except Exception:
         logging.exception("Failed to remove file")
         await update.message.reply_text("❌ فشل حذف الملف.")
 
 
 async def allow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
+    if not is_authorized(update.effective_user.id, getattr(update.effective_user, 'username', None)):
         return
     args = context.args
     if not args:
@@ -916,7 +950,7 @@ async def allow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
+    if not is_authorized(update.effective_user.id, getattr(update.effective_user, 'username', None)):
         return
     args = context.args
     if not args:
