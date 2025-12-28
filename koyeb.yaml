@@ -28,4 +28,4 @@ services:
       repository: github.com/ahmad2dragon22-stack/Hosting-telegram-bots
       branch: main
       run_command: python main.py
-# Forced redeployment trigger (updated for latest files)
+# Forced redeployment trigger (updated for latest files - v2)
