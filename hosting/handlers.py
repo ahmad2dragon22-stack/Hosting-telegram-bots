@@ -1,31 +1,137 @@
+import json
 import logging
-import threading
-from hosting.config import BOT_TOKEN
-from hosting.health import run_health_server
-from hosting.handlers import register_handlers
-from telegram.ext import Application
+import time
+import urllib.parse
+import shutil
+from pathlib import Path
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes, JobQueue
+from telegram.helpers import escape_markdown
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-
-
-def main():
-    # Start health check server
-    health_thread = threading.Thread(target=run_health_server, daemon=True)
-    health_thread.start()
-
-    application = Application.builder().token(BOT_TOKEN).build()
-
-    # register handlers and get startup hook
-    startup_hook = register_handlers(application)
-    if startup_hook:
-        application.post_init(startup_hook)
-
-    print("Main Hosting Bot is running...")
-    application.run_polling()
+from .config import BOTS_DIR, ADMIN_ID, VERSION
+from .metadata import _load_metadata, _save_metadata, is_authorized, get_user_stars, consume_user_star
+from .process_manager import start_bot_process, install_requirements, running_bots, get_system_usage, get_bot_usage, check_errors
+import datetime
 
 
-if __name__ == "__main__":
-    main()
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id, getattr(update.effective_user, 'username', None)):
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("🖥 لوحة التحكم", callback_data="dashboard_btn")],
+        [InlineKeyboardButton("⬆️ رفع بوت جديد", callback_data="upload_bot_btn")],
+        [InlineKeyboardButton("ℹ️ معلومات", callback_data="info_btn")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        "👋 أهلاً بك في مدير استضافة البوتات.",
+        reply_markup=reply_markup
+    )
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update.effective_user.id, getattr(update.effective_user, 'username', None)):
+        return
+
+    user_id = update.effective_user.id
+    meta = _load_metadata()
+    bots_count = sum(1 for b_name, b_info in meta.get("bots", {}).items() if b_info.get("files") and b_info["files"][0].get("uploaded_by") == user_id)
+    user_stars = get_user_stars(user_id)
+
+    max_bots = 1
+    if user_stars > 0:
+        max_bots = 5
+
+    if bots_count >= max_bots:
+        await update.message.reply_text(f"❌ لقد وصلت إلى الحد الأقصى لعدد البوتات المسموح بها ({max_bots}).")
+        return
+
+    doc = update.message.document
+    if not (doc.file_name.endswith(".py") or doc.file_name.lower() == "requirements.txt" or doc.file_name.lower().endswith(".txt")):
+        await update.message.reply_text("❌ يرجى رفع ملفات Python فقط (.py) أو ملف requirements.txt")
+        return
+
+    bot_name = None
+    if update.message.caption:
+        cap = update.message.caption.strip()
+        if cap.lower().startswith("bot:"):
+            bot_name = cap.split(":", 1)[1].strip()
+
+    if not bot_name:
+        bot_name = Path(doc.file_name).stem
+
+    bot_dir = BOTS_DIR / bot_name
+    bot_dir.mkdir(parents=True, exist_ok=True)
+
+    import uuid
+    version_id = uuid.uuid4().hex[:8]
+    safe_name = f"{version_id}_{Path(doc.file_name).name}"
+    file_path = bot_dir / safe_name
+
+    new_file = await context.bot.get_file(doc.file_id)
+    saved = False
+    try:
+        if hasattr(new_file, "download_to_drive"):
+            await new_file.download_to_drive(str(file_path))
+        elif hasattr(new_file, "download"):
+            await new_file.download(str(file_path))
+        else:
+            bio = await new_file.download_as_bytearray()
+            file_path.write_bytes(bio)
+        saved = file_path.exists()
+    except Exception:
+        logging.exception("Failed to download file")
+        saved = file_path.exists()
+
+    if not saved:
+        await update.message.reply_text(f"❌ فشل حفظ الملف {doc.file_name} على الخادم.")
+        return
+
+    meta.setdefault("bots", {})
+    bot_meta = meta["bots"].setdefault(bot_name, {})
+    files = bot_meta.setdefault("files", [])
+    files.append({
+        "id": version_id,
+        "filename": doc.file_name,
+        "path": str(file_path),
+        "uploaded_by": update.effective_user.id,
+        "uploaded_at": int(time.time())
+    })
+    bot_meta.setdefault("settings", {
+        "enabled": True,
+        "auto_restart": True,
+        "main": files[-1]["path"]
+    })
+    _save_metadata(meta)
+
+    if doc.file_name.lower() == 'requirements.txt':
+        await update.message.reply_text("🔧 تم حفظ requirements.txt. جاري تثبيت الحزم...")
+        ok, out = install_requirements(bot_dir)
+        if ok:
+            await update.message.reply_text("✅ تم تثبيت الحزم بنجاح. راجع install.log للمخرجات.")
+        else:
+            await update.message.reply_text("⚠️ حدث خطأ أثناء التثبيت. راجع install.log للمخرجات.")
+        return
+
+    safe_file_name = escape_markdown(doc.file_name, version=2)
+    safe_bot_name = escape_markdown(bot_name, version=2)
+    safe_version_id = escape_markdown(version_id, version=2)
+
+    await update.message.reply_text(
+        f"📥 تم استلام {safe_file_name} للبوت `{safe_bot_name}` (id={safe_version_id}). جاري التشغيل...",
+        parse_mode="MarkdownV2"
+    )
+
+    success, error = start_bot_process(file_path, bot_name)
+
+    if success:
+        await update.message.reply_text(f"✅ تم تشغيل `{safe_bot_name}` باستخدام الملف `{safe_file_name}`", parse_mode="MarkdownV2")
+    else:
+        safe_error = escape_markdown(error or 'Unknown error', version=2)
+        await update.message.reply_text(f"❌ فشل التشغيل:\n`{safe_error}`", parse_mode="MarkdownV2")
+
 
 async def get_dashboard_markup(meta_data):
     keyboard = []
@@ -37,8 +143,6 @@ async def get_dashboard_markup(meta_data):
         safe = urllib.parse.quote_plus(bot_name)
         is_running = bot_name in running_bots
         status_icon = "🟢" if is_running else "🔴"
-        
-        # إضافة معلومات الاستهلاك بجانب اسم البوت إذا كان يعمل
         usage_text = ""
         if is_running:
             cpu, ram = get_bot_usage(running_bots[bot_name]["pid"])
@@ -57,13 +161,13 @@ async def get_dashboard_markup(meta_data):
     keyboard.append([InlineKeyboardButton("🔄 تحديث اللوحة", callback_data="dashboard_btn")])
     return InlineKeyboardMarkup(keyboard)
 
+
 async def send_dashboard(message_object, context: ContextTypes.DEFAULT_TYPE):
     meta = _load_metadata()
     bots = meta.get("bots", {})
 
     cpu, ram = get_system_usage()
     active_count = len(running_bots)
-    
     text = (
         "🖥 *لوحة التحكم الاحترافية*\n\n"
         f"📊 *استهلاك السيرفر:*\n"
@@ -73,15 +177,17 @@ async def send_dashboard(message_object, context: ContextTypes.DEFAULT_TYPE):
     )
 
     reply_markup = await get_dashboard_markup(meta)
-    if isinstance(message_object, Update): # Called from callback
+    if isinstance(message_object, Update):
         await message_object.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
     else:
         await message_object.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+
 
 async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_user.id, getattr(update.effective_user, 'username', None)):
         return
     await send_dashboard(update.message, context)
+
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -93,7 +199,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"🔖 إصدار البوت: {VERSION}\n👤 المالك: @ahmaddragon\n📦 عدد البوتات المحفوظة: {len(meta.get('bots', {}))}")
         return
     elif data == "dashboard_btn":
-        await send_dashboard(query.message, context) 
+        await send_dashboard(query.message, context)
         return
     elif data == "upload_bot_btn":
         await query.edit_message_text("الرجاء رفع ملف Python (بصيغة .py) لتشغيله.\n\nيمكنك كتابة `bot:اسم_البوت` في وصف الملف لتسميته.")
@@ -130,7 +236,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text("⚠️ البوت متوقف بالفعل أو غير موجود.")
     elif cmd == "run":
-        # شغّل البوت المخزن باستخدام المسار الرئيسي في الإعدادات
         if bot_name in meta.get("bots", {}):
             bot_meta = meta["bots"][bot_name]
             main_path = None
@@ -152,7 +257,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text("⚠️ لا توجد ميتاداتا لهذا البوت.")
     elif cmd == "delete":
-        # حذف المجلد والميتا
         if bot_name in meta.get("bots", {}):
             try:
                 bot_dir = BOTS_DIR / bot_name
@@ -167,7 +271,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text("⚠️ لا توجد ميتاداتا لهذا البوت.")
     elif cmd == "files":
-        # عرض قائمة الملفات للبوت
         if bot_name in meta.get('bots', {}):
             bot_meta = meta['bots'][bot_name]
             files = bot_meta.get('files', [])
@@ -197,7 +300,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         content = content[:3500] + "\n... (محتوى طويل جداً تم اقتطاعه)"
                     keyboard = [[InlineKeyboardButton("تعديل الملف", callback_data=f"editfile_{_bot_name}_{file_id}")]]
                     reply_markup = InlineKeyboardMarkup(keyboard)
-                    await query.edit_message_text(f"📄 محتوى `{target_file['filename']}`:\n```python\n{escape_markdown(content, version=2)}\n```", parse_mode="MarkdownV2", reply_markup=reply_markup)
+                    await query.edit_message_text(f"📄 محتوى {target_file['filename']}:\n```python\n{escape_markdown(content, version=2)}\n```", parse_mode="MarkdownV2", reply_markup=reply_markup)
                 else:
                     await query.edit_message_text("⚠️ لا يمكن عرض هذا النوع من الملفات أو الملف غير موجود.")
             else:
@@ -211,26 +314,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             files = bot_meta.get('files', [])
             target_file = next((f for f in files if f['id'] == file_id), None)
             if target_file:
-                await query.edit_message_text(f"🛠️ أرسل لي الكود الجديد للملف `{target_file['filename']}`\. سأقوم باستبدال المحتوى بالكامل.", parse_mode="MarkdownV2")
+                await query.edit_message_text(f"🛠️ أرسل لي الكود الجديد للملف `{target_file['filename']}`. سأقوم باستبدال المحتوى بالكامل.", parse_mode="MarkdownV2")
                 context.user_data['editing_file'] = target_file['path']
             else:
                 await query.edit_message_text("⚠️ الملف غير موجود في الميتاداتا.")
         else:
             await query.edit_message_text("⚠️ لا توجد ميتاداتا لهذا البوت.")
     elif cmd == "errors":
-        # عرض محتوى ملف الخطأ للبوت
         bot_dir = BOTS_DIR / bot_name
         err = bot_dir / 'error.log'
         if err.exists():
             txt = err.read_text(encoding='utf-8')
-            # trim if too long
             if len(txt) > 3500:
                 txt = txt[-3500:]
             await query.edit_message_text(f"📛 سجلات الأخطاء ل{bot_name}:\n```\n{escape_markdown(txt, version=2)}\n```", parse_mode="MarkdownV2")
         else:
             await query.edit_message_text("ℹ️ لا توجد سجلات أخطاء لهذا البوت.")
     elif cmd == "cfg":
-        # عرض إعدادات البوت
         if bot_name in meta.get("bots", {}):
             bot_meta = meta["bots"][bot_name]
             settings = bot_meta.get("settings", {})
@@ -254,18 +354,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return
 
-# New handler for editing file content
+
 async def handle_code_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_user.id, getattr(update.effective_user, 'username', None)):
         return
 
-    if 'editing_file' in context.user_data and update.message.text:
+    if 'editing_file' in context.user_data and update.message and update.message.text:
         file_path = Path(context.user_data['editing_file'])
         try:
             file_path.write_text(update.message.text, encoding='utf-8')
             await update.message.reply_text(f"✅ تم تحديث الملف `{escape_markdown(file_path.name, version=2)}` بنجاح.", parse_mode="MarkdownV2")
             del context.user_data['editing_file']
-            # Attempt to restart the bot if it's currently running and this is its main file
             for bot_name, bot_info in running_bots.items():
                 if Path(bot_info['path']) == file_path:
                     await update.message.reply_text(f"🔄 جاري إعادة تشغيل البوت `{escape_markdown(bot_name, version=2)}` لتطبيق التغييرات...", parse_mode="MarkdownV2")
@@ -282,50 +381,6 @@ async def handle_code_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             del context.user_data['editing_file']
         return
 
-
-async def check_errors(context: ContextTypes.DEFAULT_TYPE):
-    """وظيفة دورية للتحقق من الأخطاء في البوتات المشغلة"""
-    meta = _load_metadata() # Load metadata here
-    for bot_name, data in list(running_bots.items()):
-        process = data["process"]
-        # التحقق إذا توقفت العملية فجأة
-        poll = process.poll()
-        if poll is not None:
-            # العملية توقفت، نحاول قراءة السجل من ملف error.log
-            bot_dir = BOTS_DIR / bot_name
-            err_path = bot_dir / 'error.log'
-            stderr = ''
-            try:
-                if err_path.exists():
-                    stderr = err_path.read_text(encoding='utf-8')[-4000:]
-                
-                # إرسال التنبيه إلى مالك البوت، أو إلى الأدمن الافتراضي إذا لم يتم العثور على مالك
-                owner_id = ADMIN_ID
-                bot_meta = meta["bots"].get(bot_name, {})
-                files = bot_meta.get("files", [])
-                if files:
-                    # Assuming the owner is the uploader of the first file
-                    owner_id = files[0].get("uploaded_by", ADMIN_ID)
-
-                await context.bot.send_message(
-                    chat_id=owner_id,
-                    text=f"🚨 البوت `{bot_name}` توقف عن العمل!\n\n**الخطأ (آخر جزء):**\n`{stderr}`",
-                    parse_mode="Markdown"
-                )
-
-            except Exception as e:
-                logging.exception(f"Failed to notify admin about bot {bot_name} error: {e}")
-            finally:
-                # أزل البوت من running list ووسم التوقف
-                try:
-                    if bot_name in running_bots:
-                        del running_bots[bot_name]
-                except Exception:
-                    pass
-                # قم بتحديث الميتاداتا بعد إزالة البوت من قائمة التشغيل
-                if bot_name in meta.get('bots', {}):
-                    meta["bots"][bot_name]["last_exit"] = int(time.time())
-                    _save_metadata(meta)
 
 async def schedule_task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_user.id, getattr(update.effective_user, 'username', None)):
@@ -352,12 +407,9 @@ async def schedule_task_command(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("❗ صيغة الوقت غير صالحة. استخدم HH:MM.")
         return
     
-    # Use JobQueue to schedule the task
     job_queue: JobQueue = context.application.job_queue
 
-    # Define the callback for the scheduled job
     async def scheduled_action(ctx: ContextTypes.DEFAULT_TYPE):
-        # reload metadata at execution time
         meta = _load_metadata()
         if action == "start":
             try:
@@ -366,7 +418,7 @@ async def schedule_task_command(update: Update, context: ContextTypes.DEFAULT_TY
                 files = meta.get("bots", {}).get(bot_name, {}).get("files", [])
                 main_p = Path(files[-1]["path"]) if files else None
             if main_p:
-                await start_bot_process(main_p, bot_name)
+                start_bot_process(main_p, bot_name)
             await ctx.bot.send_message(chat_id=ADMIN_ID, text=f"▶️ تم تشغيل البوت المجدول: {bot_name}")
         elif action == "stop":
             if bot_name in running_bots:
@@ -374,20 +426,17 @@ async def schedule_task_command(update: Update, context: ContextTypes.DEFAULT_TY
                 del running_bots[bot_name]
                 await ctx.bot.send_message(chat_id=ADMIN_ID, text=f"⛔ تم إيقاف البوت المجدول: {bot_name}")
 
-    # Schedule the job
     if frequency == "daily":
-        import datetime as _dt
-        job_queue.run_daily(scheduled_action, time=_dt.time(hour=hour, minute=minute), data={"bot_name": bot_name, "action": action})
+        job_queue.run_daily(scheduled_action, time=datetime.time(hour=hour, minute=minute), data={"bot_name": bot_name, "action": action})
         await update.message.reply_text(f"✅ تم جدولة {action} للبوت {bot_name} يومياً في {time_str}.")
     else:
-        # For 'once', we need to calculate the next run time
         now = datetime.datetime.now()
         target_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if target_time < now:
             target_time += datetime.timedelta(days=1)
-        
         job_queue.run_once(scheduled_action, when=target_time, data={"bot_name": bot_name, "action": action})
         await update.message.reply_text(f"✅ تم جدولة {action} للبوت {bot_name} مرة واحدة في {time_str}.")
+
 
 async def files_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update.effective_user.id, getattr(update.effective_user, 'username', None)):
@@ -535,7 +584,6 @@ async def removefile_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     bot_meta = meta["bots"][bot_name]
     files = bot_meta.get("files", [])
     target = None
-    # find by id or index
     for i, f in enumerate(files):
         if f["id"] == fid or str(i+1) == fid:
             target = f
@@ -549,7 +597,6 @@ async def removefile_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if p.exists():
             p.unlink()
         files.pop(idx)
-        # if removed main, pick last as main
         settings = bot_meta.setdefault("settings", {})
         if settings.get("main") == str(p):
             settings["main"] = files[-1]["path"] if files else None
@@ -615,7 +662,6 @@ async def grant_stars_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     entry['expiry'] = expiry
     _save_metadata(meta)
     await update.message.reply_text(f"⭐ تم إضافة {count} نجوم للمستخدم {uid} لمدة {days} يوم.")
-    # Notify admin/owner about delivery
     try:
         await context.bot.send_message(chat_id=ADMIN_ID, text=f"تم توصيل {count} نجوم إلى {uid} من قبل {update.effective_user.id}")
     except Exception:
@@ -673,7 +719,6 @@ async def storage_get_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not path.exists():
         await update.message.reply_text("⚠️ الملف غير موجود.")
         return
-    # إذا كان ملف نصي نعرضه، وإلا نرسله كملف
     try:
         txt = path.read_text(encoding='utf-8')
         if len(txt) > 3500:
@@ -682,79 +727,15 @@ async def storage_get_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception:
         await update.message.reply_document(document=path)
 
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == "/":
-            self.send_response(200)
-            self.send_header("Content-type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"OK")
-        else:
-            self.send_response(404)
-            self.end_headers()
 
-def run_health_server():
-    server_address = ("", 8000)
-    httpd = HTTPServer(server_address, HealthCheckHandler)
-    print("Health check server running on port 8000...")
-    httpd.serve_forever()
-
-def main():
-    # Start health check server in a separate thread
-    health_thread = threading.Thread(target=run_health_server, daemon=True)
-    health_thread.start()
-
-    async def _periodic_check(app: Application):
-        await asyncio.sleep(10)
-        class _SimpleContext:
-            def __init__(self, bot):
-                self.bot = bot
-
-        while True:
-            try:
-                await check_errors(_SimpleContext(app.bot))
-            except Exception:
-                logging.exception("Error in periodic_check")
-            await asyncio.sleep(30)
-
-    async def restart_all_bots():
-        """إعادة تشغيل جميع البوتات التي كانت تعمل عند الإغلاق"""
-        meta = _load_metadata()
-        bots = meta.get("bots", {})
-        for bot_name, bot_meta in bots.items():
-            settings = bot_meta.get("settings", {})
-            if settings.get("enabled", True) and settings.get("auto_restart", True):
-                main_path = settings.get("main")
-                if not main_path:
-                    files = bot_meta.get("files", [])
-                    if files:
-                        main_path = files[-1]["path"]
-                
-                if main_path and Path(main_path).exists():
-                    logging.info(f"Auto-restarting bot: {bot_name}")
-                    start_bot_process(main_path, bot_name)
-
-    async def _on_startup(app: Application):
-        # تشغيل البوتات المخزنة
-        await restart_all_bots()
-        
-        # إذا كانت JobQueue متاحة نستخدمها، وإلا ننشئ مهمة دورية بعد بدء التطبيق
-        if app.job_queue is not None:
-            app.job_queue.run_repeating(check_errors, interval=30, first=10)
-        else:
-            app.create_task(_periodic_check(app))
-
-    application = Application.builder().token(BOT_TOKEN).post_init(_on_startup).build()
-
-    # Add message handler for code editing
-    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_code_message))
-
+def register_handlers(application):
+    from telegram.ext import CommandHandler, MessageHandler, filters, CallbackQueryHandler
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("dashboard", dashboard))
     application.add_handler(CommandHandler("files", files_command))
     application.add_handler(CommandHandler("config", config_command))
     application.add_handler(CommandHandler("set", set_command))
-    application.add_handler(CommandHandler("schedule", schedule_task_command)) # New command
+    application.add_handler(CommandHandler("schedule", schedule_task_command))
     application.add_handler(CommandHandler("startbot", startbot_command))
     application.add_handler(CommandHandler("stopbot", stopbot_command))
     application.add_handler(CommandHandler("restartbot", restartbot_command))
@@ -766,12 +747,25 @@ def main():
     application.add_handler(CommandHandler("storage_list", storage_list_command))
     application.add_handler(CommandHandler("storage_get", storage_get_command))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_code_message))
     application.add_handler(CallbackQueryHandler(button_handler))
 
-    print("Main Hosting Bot is running...")
-    application.run_polling()
+    async def _on_startup(app):
+        # restart bots
+        meta = _load_metadata()
+        bots = meta.get("bots", {})
+        for bot_name, bot_meta in bots.items():
+            settings = bot_meta.get("settings", {})
+            if settings.get("enabled", True) and settings.get("auto_restart", True):
+                main_path = settings.get("main")
+                if not main_path:
+                    files = bot_meta.get("files", [])
+                    if files:
+                        main_path = files[-1]["path"]
+                if main_path and Path(main_path).exists():
+                    start_bot_process(main_path, bot_name)
 
-if __name__ == "__main__":
-    # Import datetime for scheduling
-    import datetime
-    main()
+        if app.job_queue is not None:
+            app.job_queue.run_repeating(check_errors, interval=30, first=10)
+
+    return _on_startup
