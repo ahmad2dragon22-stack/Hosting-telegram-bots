@@ -13,7 +13,16 @@ def main():
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    try:
+        application = Application.builder().token(BOT_TOKEN).build()
+    except AttributeError as e:
+        logging.exception("Failed to build Application (likely incompatible python-telegram-bot / Python version)")
+        import sys
+        sys.exit(
+            "Application build failed due to AttributeError. "
+            "This often indicates an incompatible combination of Python and python-telegram-bot. "
+            "Try running with Python 3.11 or pinning a compatible python-telegram-bot version in requirements.txt (for example 20.5/20.6)."
+        )
 
     # register handlers and get startup hook
     startup_hook = register_handlers(application)
@@ -219,7 +228,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             files = bot_meta.get('files', [])
             target_file = next((f for f in files if f['id'] == file_id), None)
             if target_file:
-                await query.edit_message_text(f"🛠️ أرسل لي الكود الجديد للملف `{target_file['filename']}`\. سأقوم باستبدال المحتوى بالكامل.", parse_mode="MarkdownV2")
+                await query.edit_message_text(f"🛠️ أرسل لي الكود الجديد للملف `{target_file['filename']}`\\. سأقوم باستبدال المحتوى بالكامل.", parse_mode="MarkdownV2")
                 context.user_data['editing_file'] = target_file['path']
             else:
                 await query.edit_message_text("⚠️ الملف غير موجود في الميتاداتا.")
@@ -752,7 +761,16 @@ def main():
         else:
             app.create_task(_periodic_check(app))
 
-    application = Application.builder().token(BOT_TOKEN).post_init(_on_startup).build()
+    try:
+        application = Application.builder().token(BOT_TOKEN).post_init(_on_startup).build()
+    except AttributeError:
+        logging.exception("Failed to build Application on second attempt (likely incompatible python-telegram-bot / Python version)")
+        import sys
+        sys.exit(
+            "Application build failed due to AttributeError. "
+            "This often indicates an incompatible combination of Python and python-telegram-bot. "
+            "Try running with Python 3.11 or pinning a compatible python-telegram-bot version in requirements.txt (for example 20.5/20.6)."
+        )
 
     # Add message handler for code editing
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_code_message))
