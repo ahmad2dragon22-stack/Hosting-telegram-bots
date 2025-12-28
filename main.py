@@ -18,7 +18,15 @@ def main():
     # register handlers and get startup hook
     startup_hook = register_handlers(application)
     if startup_hook:
-        application.post_init(startup_hook)
+        # schedule startup hook to run when the application is running
+        try:
+            application.create_task(startup_hook(application))
+        except Exception:
+            # fallback: if create_task not available, attempt to set via post_init
+            try:
+                application.post_init(startup_hook)
+            except Exception:
+                pass
 
     print("Main Hosting Bot is running...")
     application.run_polling()

@@ -95,6 +95,13 @@ def start_bot_process(file_path, bot_name, extra_env: dict = None):
 
         def _reader(pipe, path):
             try:
+                # simple rotation: if file >5MB rename to .old.timestamp
+                try:
+                    if path.exists() and path.stat().st_size > 5 * 1024 * 1024:
+                        old = path.with_suffix(f".old.{int(time.time())}")
+                        path.replace(old)
+                except Exception:
+                    pass
                 with open(path, 'a', encoding='utf-8') as fh:
                     for line in iter(pipe.readline, ''):
                         fh.write(f"[{int(time.time())}] {line}")
@@ -133,9 +140,11 @@ async def check_errors(context):
             try:
                 if err_path.exists():
                     stderr = err_path.read_text(encoding='utf-8')[-4000:]
-                owner_id = meta.get('bots', {}).get(bot_name, {}).get('files', [{}])[0].get('uploaded_by')
-                if not owner_id:
-                    owner_id = ADMIN_ID
+                owner = meta.get('bots', {}).get(bot_name, {}).get('files', [{}])[0].get('uploaded_by')
+                try:
+                    owner_id = int(owner) if owner is not None else int(ADMIN_ID)
+                except Exception:
+                    owner_id = int(ADMIN_ID)
                 await context.bot.send_message(
                     chat_id=owner_id,
                     text=f"🚨 البوت `{bot_name}` توقف عن العمل!\n\n**الخطأ (آخر جزء):**\n`{stderr}`",
