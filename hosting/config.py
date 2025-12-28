@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-VERSION = "2.4"
+VERSION = "3.2"
 DEFAULT_ADMIN_ID = 8049455831
 DEFAULT_BOT_TOKEN = "8328934625:AAEKHcqH7jbizVE6iByqIOikVpEVmshbwr0"
 
