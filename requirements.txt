@@ -1,2 +1,2 @@
-python-telegram-bot[job-queue]==20.6
+python-telegram-bot[job-queue]==20.7
 psutil==5.9.5
