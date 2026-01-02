@@ -1,2 +1,1 @@
-python-telegram-bot[job-queue]==20.5
-psutil==5.9.5
+pyTelegramBotAPI==4.26.0
